@@ -65,3 +65,13 @@
   - 根因（NapCat 5c18a625 源码证实）：单独 `set_friend_remark` 会先 `isBuddy()` 检查，新建好友关系刚通过时 NapCat 本地缓存还没刷新成 buddy → throw "用户 XX 不是好友"，被 plugin 的 `raise_on_error=False` 静默吞掉。手动路径成功是因为 `set_friend_add_request` 时**带 remark**，NapCat 内部原子处理无 isBuddy 检查
   - 备份：`handlers.py.bak.20260819_002124`（服务器）
   - 服务器端到端验证：容器内 mock LLM 返回「通过」+ 备注「真·小周」，实测 `set_friend_add_request` params 真的包含 `remark='真·小周'`
+- 2026-10-31: 修复好友备注无法生效的时序死锁与手动审批无备注缺陷
+  - **根因深查**：
+    1. 刚同意好友申请时，腾讯服务器建立关系有 1.5~4s 延迟，NapCat 此时查 isBuddy 必失败，旧代码 0.5s 后调用必抛“用户不是好友”，且被 raise_on_error=False 静默吞掉并打印虚假成功日志；
+    2. 管理员手动私聊 /同意 <QQ号> 未附带备注时，原本直接丢弃了申请人在验证问题中填写的真名/代号。
+  - **修复实现**：
+    1. 新增 extract_remark_from_comment 智能提取验证问答中的代号/真名；
+    2. 确立备注优先级：管理员显式备注 > 验证消息智能提取 > LLM 生成 > 昵称兜底；
+    3. 新增 set_friend_remark_with_retry 带退避重试机制（[0.5s, 1.5s, 2.5s, 4.0s]），直到 NapCat 返回 status == 'ok' 才记录成功；
+    4. 调整时序：等待备注生效后再发送欢迎语，避免陌生人消息拒发。
+  - **验证**：17 项单元测试全部通过（新增正则提取与多轮重试测试套件）。

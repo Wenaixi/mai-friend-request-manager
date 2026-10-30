@@ -20,7 +20,7 @@ from aiohttp import web
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin
 
 from .config import FriendRequestHandlerConfig
-from .handlers import handle_auto_approve, handle_llm_decision, handle_manual
+from .handlers import handle_auto_approve, handle_llm_decision, handle_manual, extract_remark_from_comment, set_friend_remark_with_retry
 
 # 有界 trim：超过上限保留最近 N 条（按插入顺序 FIFO 淘汰最旧）
 NOTIFIED_FLAGS_MAX = 250
@@ -219,7 +219,15 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             return True, None, True
 
         flag = record.get("flag", "")
-        remark = str(matched_groups.get("remark") or "").strip() if approve else ""
+        comment = record.get("comment", "")
+        admin_remark = str(matched_groups.get("remark") or "").strip() if approve else ""
+        
+        # 备注解析优先级：管理员显式备注 > 验证消息智能提取 > 申请人昵称
+        remark = admin_remark
+        if approve and not remark:
+            remark = extract_remark_from_comment(comment)
+            if not remark:
+                remark = record.get("nickname", "")
 
         params: Dict[str, Any] = {"flag": flag, "approve": bool(approve)}
         if approve and remark:
@@ -237,11 +245,8 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
 
         if approve:
             if remark:
-                await asyncio.sleep(0.5)
-                try:
-                    await self._call_napcat("set_friend_remark", {"user_id": int(target_qq), "remark": remark}, raise_on_error=False)
-                except Exception as exc:
-                    self.ctx.logger.warning(f"设置好友备注失败: {exc}")
+                # 等待退避重试设置备注生效后再发送欢迎语，确保好友关系已在服务端建立
+                await set_friend_remark_with_retry(self, target_qq, remark)
             await asyncio.sleep(1.0)
             for msg in [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]:
                 try:
@@ -249,7 +254,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
                 except Exception as exc:
                     self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
                 await asyncio.sleep(0.5)
-            remark_tip = f"（备注: {remark}）" if remark else ""
+            remark_tip = f"（已设置备注: {remark}）" if remark else ""
             await self._reply(stream_id, f"已同意 QQ {target_qq} 的好友申请。{remark_tip}")
         else:
             await self._reply(stream_id, f"已拒绝 QQ {target_qq} 的好友申请。")

@@ -635,3 +635,47 @@ class TestHandleLlmDecisionRemarkFix:
         # LLM 失败时不应调 set_friend_add_request
         add_req_calls = [c for c in napcat_calls if c[0] == "set_friend_add_request"]
         assert len(add_req_calls) == 0, "LLM 失败回退到 manual 时不应调 NapCat"
+
+
+class TestRemarkExtractionAndRetry:
+    """针对好友备注智能提取与多轮退避重试的专项测试。"""
+
+    def test_extract_remark_from_various_comments(self):
+        from whitefox.handlers import extract_remark_from_comment
+
+        # 真实用例 1~6
+        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:小周\n问题2:...") == "小周"
+        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:比利兹\n问题2:...") == "比利兹"
+        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:鹿野\n问题2:...") == "鹿野"
+        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:睡一天\n问题2:...") == "睡一天"
+        assert extract_remark_from_comment("问题1:你是谁，给个备注\n回答:老东西\n问题2:...") == "老东西"
+        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:小鸭\n问题2:...") == "小鸭"
+
+        # 单行格式
+        assert extract_remark_from_comment("备注：一只小猫咪") == "一只小猫咪"
+        assert extract_remark_from_comment("代号: 007") == "007"
+
+        # 空或敷衍内容应返回空字符串
+        assert extract_remark_from_comment("") == ""
+        assert extract_remark_from_comment("问题1:代号\n回答:不知道") == ""
+
+    @pytest.mark.asyncio
+    async def test_set_friend_remark_retries_until_ok(self):
+        from whitefox.handlers import set_friend_remark_with_retry
+
+        plugin = _make_llm_handler_decision_test_plugin()
+        attempt_records = []
+
+        # 模拟前 2 次返回失败（用户还不是好友），第 3 次成功
+        async def fake_call(action, params, raise_on_error=False):
+            attempt_records.append(action)
+            if len(attempt_records) < 3:
+                return {"status": "failed", "retcode": 1400, "message": "用户 12345 不是好友"}
+            return {"status": "ok", "retcode": 0, "data": {}}
+
+        with patch.object(FriendRequestHandlerPlugin, "_call_napcat", new=AsyncMock(side_effect=fake_call)):
+            # 传入短时延加快测试
+            ok = await set_friend_remark_with_retry(plugin, "12345", "小鸭", delays=[0.01, 0.01, 0.01, 0.01])
+
+        assert ok is True
+        assert len(attempt_records) == 3, f"应该重试 3 次才成功，实际 {len(attempt_records)}"

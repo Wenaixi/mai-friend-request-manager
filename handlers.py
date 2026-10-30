@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING, Any, Dict, List
 
 if TYPE_CHECKING:
@@ -54,6 +55,65 @@ REMARK_PROMPT = (
     '只回复备注本身，不要附加任何解释、引号或标点。'
 )
 
+def extract_remark_from_comment(comment: str) -> str:
+    """从好友申请验证消息中智能提取对方回答的真名、代号或称呼。"""
+    if not comment:
+        return ""
+    patterns = [
+        # 问答型：问题含真名/代号/备注/称呼/你是谁/名字，下方紧跟 回答: xxx
+        r"(?:真名|代号|备注|称呼|你是谁|名字)[^\n]*?(?:[:：]?\s*\n\s*|\s+)回答\s*[:：]?\s*([^\n\r]+)",
+        # 单行型：真名: xxx 或 备注: xxx
+        r"(?:真名|代号|备注|称呼|名字)\s*[:：]\s*([^\n\r]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, comment, re.IGNORECASE)
+        if m:
+            ans = m.group(1).strip().strip('"\'“”‘’「」()（）')
+            bad_words = ["知道", "了解", "喜欢你", "没有", "好玩", "扩列", "聊天"]
+            if ans and len(ans) <= 16 and not any(bad in ans for bad in bad_words):
+                return ans
+    return ""
+
+
+async def set_friend_remark_with_retry(
+    plugin: "FriendRequestHandlerPlugin",
+    user_id: str,
+    remark: str,
+    delays: list[float] | None = None,
+) -> bool:
+    """带退避重试的好友备注设置器。
+
+    NapCat 同意好友申请后，NTQQ 同步好友列表写入 SQLite 缓存需 1.5~4 秒。
+    在 isBuddy 确认前直接调用会抛出“用户不是好友”。本函数通过多轮退避轮询，
+    直到 NapCat 返回 status == 'ok'，彻底解决备注时序死锁问题。
+    """
+    if not remark:
+        return False
+
+    if delays is None:
+        delays = [0.5, 1.5, 2.5, 4.0]
+
+    for attempt, delay in enumerate(delays):
+        await asyncio.sleep(delay)
+        try:
+            resp = await plugin._call_napcat(
+                "set_friend_remark",
+                {"user_id": int(user_id) if str(user_id).isdigit() else str(user_id), "remark": remark},
+                raise_on_error=False,
+            )
+            is_ok = isinstance(resp, dict) and (resp.get("status") == "ok" or resp.get("retcode") == 0)
+            if is_ok:
+                plugin.ctx.logger.info(f"成功为好友 {user_id} 设置备注: {remark!r} (第 {attempt+1} 次重试生效)")
+                return True
+            err_msg = resp.get("wording") or resp.get("message") if isinstance(resp, dict) else str(resp)
+            plugin.ctx.logger.debug(f"第 {attempt+1} 次设置备注未就绪: {err_msg}")
+        except Exception as exc:
+            plugin.ctx.logger.debug(f"第 {attempt+1} 次设置备注异常: {exc}")
+
+    plugin.ctx.logger.warning(f"为好友 {user_id} 设置备注 {remark!r} 重试全耗尽，对方尚未完成好友握手")
+    return False
+
+
 
 async def handle_manual(plugin: "FriendRequestHandlerPlugin", user_id: str, flag: str, comment: str) -> None:
     admin_qqs = plugin._normalized_admin_qqs()
@@ -95,11 +155,15 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
     # 手动路径有备注、LLM 路径没备注的真凶。
     remark = ""
     if approved and plugin.config.strategy.auto_remark:
-        remark = await _generate_remark(plugin, info_text)
+        # 1. 优先从验证问答中提取用户明确给出的真名/代号
+        remark = extract_remark_from_comment(comment)
+        # 2. 问答未提取到时，由 LLM 智能生成
+        if not remark:
+            remark = await _generate_remark(plugin, info_text)
+        # 3. 仍未生成时，回退为对方 QQ 昵称
         if not remark:
             remark = await _get_nickname(plugin, user_id)
 
-    # set_friend_add_request 带 remark（关键修复，对齐手动路径 plugin.py:_handle_decision）
     params: Dict[str, Any] = {"flag": flag, "approve": approved}
     if approved and remark:
         params["remark"] = remark
@@ -110,35 +174,40 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
     )
 
     if approved:
-        plugin.ctx.logger.info(f"LLM 判定通过好友申请: user_id={user_id} remark={remark!r}")
-        # 兜底：再调一次 set_friend_remark——即使上面已生效，重复设置 idempotent
+        plugin.ctx.logger.info(f"LLM 判定通过好友申请: user_id={user_id} 拟定备注={remark!r}")
         if remark:
-            await asyncio.sleep(0.5)
-            try:
-                await plugin._call_napcat(
-                    "set_friend_remark",
-                    {"user_id": int(user_id), "remark": remark},
-                    raise_on_error=False,
-                )
-                plugin.ctx.logger.info(f"已为 {user_id} 设置备注: {remark}")
-            except Exception as exc:
-                plugin.ctx.logger.warning(f"设置好友备注兜底失败(已通过 set_friend_add_request 设置): {exc}")
+            await set_friend_remark_with_retry(plugin, user_id, remark)
         await _send_welcome(plugin, user_id)
     else:
         plugin.ctx.logger.info(f"LLM 判定拒绝好友申请: user_id={user_id}")
 
 
 async def handle_auto_approve(plugin: "FriendRequestHandlerPlugin", user_id: str, flag: str, comment: str) -> None:
+    remark = ""
+    if plugin.config.strategy.auto_remark:
+        remark = extract_remark_from_comment(comment)
+        if not remark:
+            remark = await _get_nickname(plugin, user_id)
+
+    params: Dict[str, Any] = {"flag": flag, "approve": True}
+    if remark:
+        params["remark"] = remark
+
     await plugin._call_napcat(
         "set_friend_add_request",
-        {"flag": flag, "approve": True},
+        params,
         raise_on_error=False,
     )
-    plugin.ctx.logger.info(f"自动通过好友申请: user_id={user_id}")
+    plugin.ctx.logger.info(f"自动通过好友申请: user_id={user_id} 拟定备注={remark!r}")
+
+    if remark:
+        await set_friend_remark_with_retry(plugin, user_id, remark)
 
     admin_qqs = plugin._normalized_admin_qqs()
     if admin_qqs:
         info_text = await _build_info_only_text(plugin, user_id, comment)
+        if remark:
+            info_text += f"\n已设置备注: {remark}"
         for admin_qq in admin_qqs:
             await plugin._send_private_notice(admin_qq, user_id, info_text)
 
