@@ -638,26 +638,34 @@ class TestHandleLlmDecisionRemarkFix:
 
 
 class TestRemarkExtractionAndRetry:
-    """针对好友备注智能提取与多轮退避重试的专项测试。"""
+    """针对好友备注 LLM 生成清洗与多轮退避重试的专项测试。"""
 
-    def test_extract_remark_from_various_comments(self):
-        from whitefox.handlers import extract_remark_from_comment
+    def test_strip_remark_artifacts(self):
+        from whitefox.handlers import _strip_remark_artifacts
 
-        # 真实用例 1~6
-        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:小周\n问题2:...") == "小周"
-        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:比利兹\n问题2:...") == "比利兹"
-        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:鹿野\n问题2:...") == "鹿野"
-        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:睡一天\n问题2:...") == "睡一天"
-        assert extract_remark_from_comment("问题1:你是谁，给个备注\n回答:老东西\n问题2:...") == "老东西"
-        assert extract_remark_from_comment("问题1:你的真名或者代号（给个备注）\n回答:小鸭\n问题2:...") == "小鸭"
+        # 引号/括号/前缀残留
+        assert _strip_remark_artifacts('小周') == "小周"
+        assert _strip_remark_artifacts('"小周"') == "小周"
+        assert _strip_remark_artifacts("（鹿野）") == "鹿野"
+        assert _strip_remark_artifacts("「睡一天」") == "睡一天"
+        assert _strip_remark_artifacts("备注: 老东西") == "老东西"
+        assert _strip_remark_artifacts("备注是麦麦的学妹") == "麦麦的学妹"
+        assert _strip_remark_artifacts("建议备注：小鸭") == "小鸭"
+        # 多行只取首行
+        assert _strip_remark_artifacts("小周\n好友备注") == "小周"
+        # 超长截断（不超过8个字）
+        assert _strip_remark_artifacts("这是一个非常非常长的备注测试文本用于验证长度限制") == "这是一个非常非常"
+        # 空
+        assert _strip_remark_artifacts("") == ""
 
-        # 单行格式
-        assert extract_remark_from_comment("备注：一只小猫咪") == "一只小猫咪"
-        assert extract_remark_from_comment("代号: 007") == "007"
-
-        # 空或敷衍内容应返回空字符串
-        assert extract_remark_from_comment("") == ""
-        assert extract_remark_from_comment("问题1:代号\n回答:不知道") == ""
+    def test_remark_prompt_encourages_using_comment_identity(self):
+        """REMARK_PROMPT 必须指引 LLM 综合验证问答+昵称+签名生成备注。"""
+        from whitefox.handlers import REMARK_PROMPT
+        assert "验证消息" in REMARK_PROMPT
+        assert "昵称" in REMARK_PROMPT
+        assert "个性签名" in REMARK_PROMPT
+        assert "给个备注" in REMARK_PROMPT
+        assert "8个字" in REMARK_PROMPT
 
     @pytest.mark.asyncio
     async def test_set_friend_remark_retries_until_ok(self):
@@ -679,3 +687,68 @@ class TestRemarkExtractionAndRetry:
 
         assert ok is True
         assert len(attempt_records) == 3, f"应该重试 3 次才成功，实际 {len(attempt_records)}"
+
+    @pytest.mark.asyncio
+    async def test_handle_llm_decision_uses_llm_remark_for_whole_info(self):
+        """handle_llm_decision 应把完整信息交给 LLM 生成备注（而非正则硬提取验证问答）。"""
+        from whitefox import handlers
+        plugin = _make_llm_handler_decision_test_plugin()
+
+        # LLM 第 1 次判定通过，第 2 次生成备注
+        full_prompts = []
+
+        async def fake_llm(plugin, prompt: str) -> tuple:
+            full_prompts.append(prompt)
+            return True, "通过" if len(full_prompts) == 1 else "小周"
+
+        napcat_calls = []
+        async def fake_call_napcat(action, params, raise_on_error=False):
+            napcat_calls.append((action, params))
+            if action == "get_stranger_info":
+                return {"status": "ok", "data": {"nickname": "麦麦的学妹", "long_nick": "喜欢画画", "sex": "female", "age": 18}}
+            return {"status": "ok", "retcode": 0, "data": {}}
+
+        with patch.object(handlers, "_call_llm", new=AsyncMock(side_effect=fake_llm)), \
+             patch.object(handlers, "_send_welcome", new=AsyncMock()), \
+             patch.object(handlers, "_get_nickname", new=AsyncMock(return_value="麦麦的学妹")), \
+             patch.object(FriendRequestHandlerPlugin, "_call_napcat", new=AsyncMock(side_effect=fake_call_napcat)):
+
+            await handlers.handle_llm_decision(plugin, "12345", "flag-abc",
+                                               "问题1:你的真名或者代号（给个备注）\n回答:小周\n问题2:你是加我有何目的")
+
+        # 第二个 prompt 是备注生成：必须包含昵称、签名、验证问答 = 综合全部信息
+        remark_prompt = full_prompts[1]
+        assert "小周" in remark_prompt, "备注 prompt 应包含验证问答中的真名"
+        assert "麦麦的学妹" in remark_prompt, "备注 prompt 应包含昵称"
+        assert "喜欢画画" in remark_prompt, "备注 prompt 应包含个性签名"
+
+        # set_friend_add_request 的 remark 应为 LLM 生成的备注
+        add_req = [c for c in napcat_calls if c[0] == "set_friend_add_request"][0]
+        assert add_req[1]["remark"] == "小周", f"应使用 LLM 生成的备注，实际 {add_req[1]}"
+
+    @pytest.mark.asyncio
+    async def test_handle_auto_approve_uses_llm_remark(self):
+        """handle_auto_approve 也应交给 LLM 生成备注（而非正则硬提取）。"""
+        from whitefox import handlers
+        plugin = _make_llm_handler_decision_test_plugin()
+        plugin.config.strategy.mode = "auto_approve"
+
+        async def fake_llm(plugin, prompt: str) -> tuple:
+            return True, "比利兹"
+
+        napcat_calls = []
+        async def fake_call_napcat(action, params, raise_on_error=False):
+            napcat_calls.append((action, params))
+            if action == "get_stranger_info":
+                return {"status": "ok", "data": {"nickname": "比利兹", "long_nick": "", "sex": "", "age": 0}}
+            return {"status": "ok", "retcode": 0, "data": {}}
+
+        with patch.object(handlers, "_call_llm", new=AsyncMock(side_effect=fake_llm)), \
+             patch.object(handlers, "_send_welcome", new=AsyncMock()), \
+             patch.object(handlers, "_get_nickname", new=AsyncMock(return_value="")), \
+             patch.object(FriendRequestHandlerPlugin, "_call_napcat", new=AsyncMock(side_effect=fake_call_napcat)):
+
+            await handlers.handle_auto_approve(plugin, "12345", "flag-abc", "你好呀")
+
+        add_req = [c for c in napcat_calls if c[0] == "set_friend_add_request"][0]
+        assert add_req[1]["remark"] == "比利兹", f"auto_approve 也应使用 LLM 生成的备注，实际 {add_req[1]}"

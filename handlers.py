@@ -50,29 +50,40 @@ LLM_PROMPT = (
 )
 
 REMARK_PROMPT = (
-    '你是一个QQ好友备注生成助手。根据以下申请人信息（昵称、个性签名、验证消息等），'
-    '为对方生成一个简短自然的好友备注，不超过8个字，可以参考对方昵称或验证消息中体现的身份/称呼。'
-    '只回复备注本身，不要附加任何解释、引号或标点。'
+    '你是一个QQ好友备注生成助手。你现在要为一个刚加你的新朋友设置一个 QQ 好友备注。\n'
+    '备注必须简短自然，不超过8个字，最好能一眼认出对方是谁。\n'
+    '\n'
+    '优先参考这些线索（按重要程度排序）：\n'
+    '1. 对方在验证消息的问题模板里填写的真名/代号/称呼（如果明确给了，直接用）\n'
+    '2. 对方的 QQ 昵称（尤其是"网名型"昵称，可直接采用或简化）\n'
+    '3. 对方的个性签名、个人说明中透露的身份特征\n'
+    '\n'
+    '备注要求：\n'
+    '- 不超过8个字，简洁自然，像真人备注\n'
+    '- 如果对方在验证消息里明确说了"给个备注"并给出名字，就用那个名字\n'
+    '- 如果对方昵称太中二/太长/符号多，提炼一个干净好记的称呼\n'
+    '- 不要使用"陌生人""好友""申请者"这类泛称\n'
+    '- 不要加引号、括号或任何解释性文字\n'
+    '\n'
+    '只回复备注本身（例如：小周、鹿野、麦麦的学妹），不要附加任何其他内容。'
 )
 
-def extract_remark_from_comment(comment: str) -> str:
-    """从好友申请验证消息中智能提取对方回答的真名、代号或称呼。"""
-    if not comment:
+def _strip_remark_artifacts(text: str) -> str:
+    """清洗 LLM 回复里的残留制品，只保留纯备注文本。
+
+    处理以下情况：
+    - 首尾引号/括号/书名号
+    - "备注：""备注是"这类前缀
+    - 多行回复只取第一行
+    - 超长文本按 8 字截断（与 REMARK_PROMPT 声明的一致）
+    """
+    if not text:
         return ""
-    patterns = [
-        # 问答型：问题含真名/代号/备注/称呼/你是谁/名字，下方紧跟 回答: xxx
-        r"(?:真名|代号|备注|称呼|你是谁|名字)[^\n]*?(?:[:：]?\s*\n\s*|\s+)回答\s*[:：]?\s*([^\n\r]+)",
-        # 单行型：真名: xxx 或 备注: xxx
-        r"(?:真名|代号|备注|称呼|名字)\s*[:：]\s*([^\n\r]+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, comment, re.IGNORECASE)
-        if m:
-            ans = m.group(1).strip().strip('"\'“”‘’「」()（）')
-            bad_words = ["知道", "了解", "喜欢你", "没有", "好玩", "扩列", "聊天"]
-            if ans and len(ans) <= 16 and not any(bad in ans for bad in bad_words):
-                return ans
-    return ""
+    text = text.strip().splitlines()[0].strip() if text.strip() else ""
+    text = text.strip('"\'“”‘’「」『』()（）【】[] ')
+    # 去前缀：备注：/ 备注是 / 备注为 / 好友备注：/ 建议备注：
+    text = re.sub(r"^(?:建议|好友)?备注\s*(?:应该?是|是|为|:)?\s*[:：]?\s*", "", text).strip()
+    return text[:8]
 
 
 async def set_friend_remark_with_retry(
@@ -155,12 +166,9 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
     # 手动路径有备注、LLM 路径没备注的真凶。
     remark = ""
     if approved and plugin.config.strategy.auto_remark:
-        # 1. 优先从验证问答中提取用户明确给出的真名/代号
-        remark = extract_remark_from_comment(comment)
-        # 2. 问答未提取到时，由 LLM 智能生成
-        if not remark:
-            remark = await _generate_remark(plugin, info_text)
-        # 3. 仍未生成时，回退为对方 QQ 昵称
+        # 备注完全交给 LLM：把验证问答 + 昵称 + 签名 + QQ号 全部喂给它，由它判断最合适的备注
+        remark = await _generate_remark(plugin, info_text)
+        # LLM 失败时才回退为对方 QQ 昵称（仅兜底，正常不会走到）
         if not remark:
             remark = await _get_nickname(plugin, user_id)
 
@@ -185,7 +193,9 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
 async def handle_auto_approve(plugin: "FriendRequestHandlerPlugin", user_id: str, flag: str, comment: str) -> None:
     remark = ""
     if plugin.config.strategy.auto_remark:
-        remark = extract_remark_from_comment(comment)
+        # 与 llm 模式一致：备注完全交给 LLM（综合昵称+签名+验证问答判断最合适的称呼）
+        info_text = await _build_applicant_info_text(plugin, user_id, comment)
+        remark = await _generate_remark(plugin, info_text)
         if not remark:
             remark = await _get_nickname(plugin, user_id)
 
@@ -235,13 +245,14 @@ async def _call_llm(plugin: "FriendRequestHandlerPlugin", prompt: str) -> tuple[
 
 
 async def _generate_remark(plugin: "FriendRequestHandlerPlugin", info_text: str) -> str:
-    full_prompt = f"{REMARK_PROMPT}\n\n申请人信息：\n{info_text}"
+    """交给 LLM 综合全部申请人信息生成最合适的好友备注。"""
+    full_prompt = f"{REMARK_PROMPT}\n\n申请人完整信息：\n{info_text}"
     ok, reply = await _call_llm(plugin, full_prompt)
     if not ok:
         return ""
-    remark = reply.strip().strip('"').strip("'").strip("「」").strip()
-    if len(remark) > 16:
-        remark = remark[:16]
+    remark = _strip_remark_artifacts(reply)
+    if remark:
+        plugin.ctx.logger.info(f"[friend-request] LLM 生成备注={remark!r} (原始回复={reply!r})")
     return remark
 
 
@@ -274,9 +285,11 @@ def _format_sex(value: Any) -> str:
 
 
 async def _build_applicant_info_text(plugin: "FriendRequestHandlerPlugin", user_id: str, comment: str) -> str:
-    # 故意只注入对判定有用的字段：验证消息 > 个性签名 > 昵称 > QQ 号。
-    # 不注入性别/年龄/等级/登录天数——这些字段对"是否通过"判定无意义，
-    # 反而会被 LLM 当成"风险评分"，导致 LLM 偏保守。
+    """构建交给 LLM 的申请人完整信息（判定通过 + 生成备注都用这份）。
+
+    全部字段都注入：验证消息 > 昵称 > 个性签名 > 性别/年龄/地区 > QQ号。
+    备注生成需要这些信息才能提炼出最贴合的称呼。
+    """
     info = await plugin._call_napcat(
         "get_stranger_info",
         {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
@@ -298,6 +311,10 @@ async def _build_applicant_info_text(plugin: "FriendRequestHandlerPlugin", user_
     add("QQ号", user_id)
     add("昵称", info_data.get("nickname"))
     add("个性签名", info_data.get("long_nick") or info_data.get("longNick") or info_data.get("sign"))
+    sex = _format_sex(info_data.get("sex"))
+    add("性别", sex)
+    add("年龄", info_data.get("age"))
+    add("所在地", _format_location(info_data))
     return "\n".join(lines)
 
 

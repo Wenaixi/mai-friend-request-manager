@@ -20,7 +20,7 @@ from aiohttp import web
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin
 
 from .config import FriendRequestHandlerConfig
-from .handlers import handle_auto_approve, handle_llm_decision, handle_manual, extract_remark_from_comment, set_friend_remark_with_retry
+from .handlers import handle_auto_approve, handle_llm_decision, handle_manual, set_friend_remark_with_retry
 
 # 有界 trim：超过上限保留最近 N 条（按插入顺序 FIFO 淘汰最旧）
 NOTIFIED_FLAGS_MAX = 250
@@ -221,11 +221,13 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         flag = record.get("flag", "")
         comment = record.get("comment", "")
         admin_remark = str(matched_groups.get("remark") or "").strip() if approve else ""
-        
-        # 备注解析优先级：管理员显式备注 > 验证消息智能提取 > 申请人昵称
+
+        # 备注优先级：管理员显式备注 > LLM 用完整信息智能生成（含验证问答+昵称+签名）> 记录中的昵称
         remark = admin_remark
         if approve and not remark:
-            remark = extract_remark_from_comment(comment)
+            from .handlers import _build_applicant_info_text
+            info_text = await _build_applicant_info_text(self, target_qq, comment)
+            remark = await self._generate_remark_from_info(info_text)
             if not remark:
                 remark = record.get("nickname", "")
 
@@ -350,6 +352,21 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
                 raise RuntimeError(f"NapCat 动作 {action_name} 返回错误: {error_text}")
             self.ctx.logger.debug(f"NapCat 动作 {action_name} 返回非 ok 状态: {error_text}")
         return response
+
+    async def _generate_remark_from_info(self, info_text: str) -> str:
+        """用 LLM 综合申请人完整信息（昵称+签名+验证问答+性别年龄地区）生成最合适的好友备注。
+
+        备注完全交给模型判断：明确给了真名/代号就用真名，否则在昵称基础上提炼贴合称呼。
+        """
+        from .handlers import REMARK_PROMPT, _call_llm, _strip_remark_artifacts
+        full_prompt = f"{REMARK_PROMPT}\n\n申请人完整信息：\n{info_text}"
+        ok, reply = await _call_llm(self, full_prompt)
+        if not ok:
+            return ""
+        remark = _strip_remark_artifacts(reply)
+        if remark:
+            self.ctx.logger.info(f"[friend-request] 手动审批 LLM 生成备注={remark!r} (原始={reply!r})")
+        return remark
 
     # ---- 持久化 ----
 
