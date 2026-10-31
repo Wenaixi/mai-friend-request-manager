@@ -6,7 +6,7 @@
 
 监听加好友事件，支持 Webhook（18080端口）与指令审批。
 
-- **插件目录**：`whitefox_friend-request-handler`
+- **插件目录**：`wenaixi_mai_friend_request_manager`
 - **生效版本**：`v1.3.0`
 - **开源许可证**：`MIT`
 
