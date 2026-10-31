@@ -3,7 +3,10 @@
   "version": "1.3.0",
   "name": "麦麦好友申请自动审核与管理",
   "description": "监听加好友申请，支持手动审批、LLM 智能审核、无条件自动通过三种策略",
-  "author": "Wenaixi",
+  "author": {
+    "name": "Wenaixi",
+    "url": "https://github.com/Wenaixi/mai-friend-request-manager"
+  },
   "license": "MIT",
   "urls": {
     "repository": "https://github.com/whitefox20011120/friend-request-handler"
