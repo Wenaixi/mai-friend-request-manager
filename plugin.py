@@ -46,7 +46,11 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         self._pending_tasks = set()
         self._state_lock = asyncio.Lock()
 
-        data_dir = os.path.join(os.path.dirname(__file__), "data")
+        paths = getattr(self.ctx, "paths", None)
+        if paths is not None:
+            data_dir = str(paths.data_dir)
+        else:
+            data_dir = os.path.join(os.path.dirname(__file__), "data")
         os.makedirs(data_dir, exist_ok=True)
         self._data_path = os.path.join(data_dir, "state.json")
         self._load_state()
